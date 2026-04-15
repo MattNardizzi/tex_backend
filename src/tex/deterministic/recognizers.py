@@ -240,7 +240,9 @@ class DestructiveOrBypassRecognizer(BaseRegexRecognizer):
     message = "Content appears to describe destructive action or control bypass."
     patterns = (
         re.compile(r"\bdelete all\b", re.IGNORECASE),
-        re.compile(r"\bdrop table\b", re.IGNORECASE),
+        re.compile(r"\bdelete\s+from\s+\w+", re.IGNORECASE),
+        re.compile(r"\bdrop\s+table\b", re.IGNORECASE),
+        re.compile(r"\btruncate\s+table\b", re.IGNORECASE),
         re.compile(r"\bdisable logging\b", re.IGNORECASE),
         re.compile(r"\bskip review\b", re.IGNORECASE),
         re.compile(r"\bskip approval\b", re.IGNORECASE),

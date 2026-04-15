@@ -202,7 +202,7 @@ class DecisionRouter:
         semantic_analysis: SemanticAnalysis,
     ) -> float:
         deterministic_confidence = 0.95 if deterministic_result.blocked else (
-            0.75 if deterministic_result.findings else 0.55
+            0.75 if deterministic_result.findings else 0.85
         )
 
         if specialist_bundle.is_empty:

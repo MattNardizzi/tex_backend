@@ -36,8 +36,13 @@ class HeuristicSemanticFallback:
     2. structured parsing may fail
     3. local development still needs a valid semantic result
 
-    This is not meant to be "smart." It is meant to be stable, conservative,
-    and schema-correct so the rest of the pipeline can continue operating.
+    Design principles:
+    - clean content with no keyword hits MUST be able to reach PERMIT
+    - risky content with keyword hits MUST still reach FORBID or ABSTAIN
+    - confidence scores must stay above the is_low_confidence threshold
+      (0.50) for zero-hit dimensions so the router does not auto-ABSTAIN
+    - the fallback is not trying to be smart; it is trying to produce
+      calibrated scores that let the router do its job correctly
     """
 
     _DATA_LEAKAGE_TERMS: tuple[str, ...] = (
@@ -198,7 +203,7 @@ class HeuristicSemanticFallback:
             ),
             uncertainty_flags=uncertainty_flags,
             provider_name="fallback",
-            model_name="heuristic-semantic-fallback-v1",
+            model_name="heuristic-semantic-fallback-v2",
             analyzed_at=datetime.now(UTC),
             metadata={
                 "fallback_used": True,
@@ -206,6 +211,8 @@ class HeuristicSemanticFallback:
                 "dimension_order": list(semantic_dimensions()),
             },
         )
+
+    # ── dimension builders ─────────────────────────────────────────
 
     def _build_policy_compliance_result(
         self,
@@ -238,27 +245,45 @@ class HeuristicSemanticFallback:
         evidence_spans = tuple((*keyword_hits, *clause_hits))
         hit_count = len(evidence_spans)
 
-        if retrieval_context.is_empty:
-            score = 0.35 if keyword_hits else 0.20
-            confidence = 0.38 if keyword_hits else 0.28
-            summary = "Policy grounding is limited because no retrieval context was available."
-            uncertainty_flags = (
-                "no_retrieval_context",
-                "policy_grounding_weak",
-            )
+        if hit_count == 0 and not clause_hits:
+            # ── clean content: low score, solid confidence ──
+            # Score stays well under permit_threshold (0.34).
+            # Confidence stays above is_low_confidence (0.50) so the
+            # router does not auto-ABSTAIN on this dimension.
+            if retrieval_context.is_empty:
+                score = 0.06
+                confidence = 0.56
+                summary = "No policy-risk signals detected. Retrieval context was unavailable but no lexical risk was found."
+                uncertainty_flags = ("fallback_analysis",)
+            else:
+                score = 0.04
+                confidence = min(
+                    0.80,
+                    0.60 + (0.04 * min(len(retrieval_context.policy_clauses), 4)),
+                )
+                summary = "No clear policy conflict was detected by fallback heuristics against retrieved context."
+                uncertainty_flags = ("fallback_analysis",)
         else:
-            score = min(1.0, 0.18 + (0.14 * len(keyword_hits)) + (0.10 * len(clause_hits)))
-            confidence = min(
-                0.80,
-                0.42 + (0.06 * min(len(retrieval_context.policy_clauses), 4)),
-            )
-            summary = (
-                "Fallback heuristics found potential policy-relevant signals and used "
-                "retrieved policy clauses for light grounding."
-                if hit_count
-                else "No clear policy conflict was detected by fallback heuristics against retrieved context."
-            )
-            uncertainty_flags = ("fallback_policy_analysis",) if hit_count else ("fallback_analysis",)
+            # ── risky content: escalating scores ──
+            if retrieval_context.is_empty:
+                score = 0.35 if keyword_hits else 0.20
+                confidence = 0.52 if keyword_hits else 0.50
+                summary = "Policy grounding is limited because no retrieval context was available."
+                uncertainty_flags = (
+                    "no_retrieval_context",
+                    "policy_grounding_weak",
+                )
+            else:
+                score = min(1.0, 0.18 + (0.14 * len(keyword_hits)) + (0.10 * len(clause_hits)))
+                confidence = min(
+                    0.80,
+                    0.55 + (0.06 * min(len(retrieval_context.policy_clauses), 4)),
+                )
+                summary = (
+                    "Fallback heuristics found potential policy-relevant signals and used "
+                    "retrieved policy clauses for light grounding."
+                )
+                uncertainty_flags = ("fallback_policy_analysis",)
 
         return SemanticDimensionResult(
             dimension="policy_compliance",
@@ -293,15 +318,27 @@ class HeuristicSemanticFallback:
         )
 
         hit_count = len(hits)
-        score = min(1.0, 0.08 + (0.22 * hit_count)) if hit_count else 0.06
-        confidence = min(0.78, 0.34 + (0.10 * hit_count))
         uncertainty_flags: list[str] = ["fallback_analysis"]
 
         if retrieval_context.is_empty:
             uncertainty_flags.append("no_retrieval_context")
 
         if hit_count == 0:
-            confidence = min(confidence, 0.42)
+            # ── clean dimension: low score, confidence above 0.50 ──
+            # This is the critical fix. The old fallback set zero-hit
+            # confidence at 0.34 then capped it at 0.42. That produced
+            # is_low_confidence=True on every clean dimension, which
+            # caused the router to auto-ABSTAIN via _should_abstain().
+            #
+            # New values: score is negligible (0.04), confidence is 0.58.
+            # This keeps the dimension above the 0.50 low-confidence
+            # cutoff while still being honest that this is fallback-only.
+            score = 0.04
+            confidence = 0.58
+        else:
+            # ── risky dimension: escalating score and confidence ──
+            score = min(1.0, 0.08 + (0.22 * hit_count))
+            confidence = min(0.82, 0.52 + (0.10 * hit_count))
 
         return SemanticDimensionResult(
             dimension=dimension,
@@ -317,6 +354,8 @@ class HeuristicSemanticFallback:
             uncertainty_flags=tuple(uncertainty_flags),
         )
 
+    # ── verdict recommendation ─────────────────────────────────────
+
     def _recommend_verdict(
         self,
         *,
@@ -326,6 +365,9 @@ class HeuristicSemanticFallback:
     ) -> SemanticVerdictRecommendation:
         max_score = max(result.score for result in dimension_results)
         min_confidence = min(result.confidence for result in dimension_results)
+        total_evidence_spans = sum(
+            len(result.evidence_spans) for result in dimension_results
+        )
         critical_dimensions = [
             result.dimension for result in dimension_results if result.score >= 0.78
         ]
@@ -343,6 +385,7 @@ class HeuristicSemanticFallback:
             "external_message",
         }
 
+        # ── FORBID: high-risk dimensions crossed critical threshold ──
         if critical_dimensions:
             return SemanticVerdictRecommendation(
                 verdict=Verdict.FORBID,
@@ -355,7 +398,8 @@ class HeuristicSemanticFallback:
                 uncertainty_flags=tuple((*uncertainty_flags, "high_risk_detected")),
             )
 
-        if max_score >= 0.45:
+        # ── ABSTAIN: medium-risk signals on a high-impact channel ──
+        if medium_risk_dimensions:
             flags = list(uncertainty_flags)
             flags.append("borderline_risk")
 
@@ -365,7 +409,7 @@ class HeuristicSemanticFallback:
             if high_impact_channel or min_confidence < 0.50:
                 return SemanticVerdictRecommendation(
                     verdict=Verdict.ABSTAIN,
-                    confidence=0.52,
+                    confidence=0.55,
                     summary="Fallback heuristics recommend ABSTAIN because the action is borderline or context-sensitive.",
                     rationale=(
                         "The fallback layer saw enough risk signal that automatic release would be weak, "
@@ -374,28 +418,46 @@ class HeuristicSemanticFallback:
                     uncertainty_flags=tuple(flags),
                 )
 
-        if retrieval_context.is_empty or min_confidence < 0.40:
+        # ── ABSTAIN: evidence present but below medium-risk threshold ──
+        # Only escalate when we actually found *something* concerning.
+        # The old version escalated here whenever retrieval was empty OR
+        # min_confidence < 0.40, which trapped clean content in ABSTAIN.
+        # Threshold is 0.30 (not 0.20) because light clause matches on
+        # benign content can push policy_compliance to ~0.28 without any
+        # real risk signal — those should not block PERMIT.
+        if total_evidence_spans > 0 and max_score >= 0.30:
+            flags = list(uncertainty_flags)
+            if retrieval_context.is_empty:
+                flags.append("missing_grounding")
+            flags.append("low_risk_signals_present")
             return SemanticVerdictRecommendation(
                 verdict=Verdict.ABSTAIN,
-                confidence=0.44,
-                summary="Fallback heuristics recommend ABSTAIN because grounding or confidence is too weak for an automatic PERMIT.",
+                confidence=0.52,
+                summary="Fallback heuristics recommend ABSTAIN because some risk signals were detected but they did not reach a high-risk threshold.",
                 rationale=(
-                    "The fallback layer is intentionally conservative. With limited grounding or low confidence, "
-                    "it should escalate instead of pretending certainty."
+                    "The fallback layer found low-level lexical signals. This does not warrant "
+                    "hard-blocking but the presence of any signal means automatic release is premature."
                 ),
-                uncertainty_flags=tuple((*uncertainty_flags, "weak_grounding_or_confidence")),
+                uncertainty_flags=tuple(flags),
             )
 
+        # ── PERMIT: no meaningful risk signals detected ──
+        # This path is now reachable for clean content because:
+        # - zero keyword hits → max_score ~0.04-0.06, well below 0.20
+        # - zero evidence spans → total_evidence_spans == 0
+        # - confidence ≥ 0.50 everywhere → no low-confidence triggers
         return SemanticVerdictRecommendation(
             verdict=Verdict.PERMIT,
-            confidence=0.58,
-            summary="Fallback heuristics recommend PERMIT because no strong semantic risk signals were detected.",
+            confidence=0.68,
+            summary="Fallback heuristics recommend PERMIT because no meaningful risk signals were detected.",
             rationale=(
                 "The fallback layer found no substantial lexical evidence of policy conflict, leakage, "
                 "external sharing abuse, unauthorized commitments, or destructive bypass behavior."
             ),
             uncertainty_flags=tuple(uncertainty_flags),
         )
+
+    # ── aggregate metrics ──────────────────────────────────────────
 
     def _compute_overall_confidence(
         self,
@@ -406,7 +468,10 @@ class HeuristicSemanticFallback:
         average_confidence = sum(result.confidence for result in dimension_results) / len(dimension_results)
 
         if retrieval_context.is_empty:
-            return max(0.0, round(average_confidence - 0.10, 4))
+            # Smaller penalty than before (-0.04 vs -0.10) so clean
+            # content without retrieval can still pass the router's
+            # minimum_confidence threshold after weighted fusion.
+            return max(0.0, round(average_confidence - 0.04, 4))
 
         grounded_bonus = min(0.08, 0.02 * len(retrieval_context.policy_clauses))
         return min(1.0, round(average_confidence + grounded_bonus, 4))
@@ -417,7 +482,10 @@ class HeuristicSemanticFallback:
     ) -> float:
         span_count = sum(len(result.evidence_spans) for result in dimension_results)
         if span_count == 0:
-            return 0.18
+            # Raised from 0.18 to 0.32 so the router does not penalize
+            # clean content for having no evidence (there is nothing to
+            # find, so evidence sufficiency should not be critically low).
+            return 0.32
         return min(1.0, round(0.20 + (0.10 * span_count), 4))
 
     def _compute_rationale_quality(
@@ -432,6 +500,8 @@ class HeuristicSemanticFallback:
         if not retrieval_context.is_empty:
             base += 0.10
         return min(1.0, round(base, 4))
+
+    # ── uncertainty flags ──────────────────────────────────────────
 
     def _collect_global_uncertainty_flags(
         self,
@@ -459,6 +529,8 @@ class HeuristicSemanticFallback:
 
         return tuple(ordered)
 
+    # ── summary ────────────────────────────────────────────────────
+
     def _build_summary(
         self,
         *,
@@ -477,6 +549,8 @@ class HeuristicSemanticFallback:
             f"{recommended_verdict.verdict.value}. Highest-risk dimension: "
             f"{highest.dimension} ({highest.score:.2f}). Analysis mode: {grounding_state}."
         )
+
+    # ── keyword matching ───────────────────────────────────────────
 
     def _match_keywords(
         self,
@@ -509,13 +583,15 @@ class HeuristicSemanticFallback:
         Very light clause token extraction for fallback grounding.
 
         This is intentionally crude. It only tries to pull longer lexical units
-        that may overlap with risky action content.
+        that may overlap with risky action content. Minimum length is 8 to
+        avoid matching common words like 'review', 'report', 'update' etc.
+        that appear in both policy clauses and clean business content.
         """
         raw_tokens = clause_text.replace(",", " ").replace(".", " ").split()
         tokens = []
         for token in raw_tokens:
             normalized = token.strip().casefold()
-            if len(normalized) < 6:
+            if len(normalized) < 8:
                 continue
             tokens.append(normalized)
         return tuple(dict.fromkeys(tokens))
