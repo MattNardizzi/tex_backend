@@ -26,7 +26,7 @@ else:
     _OPENAI_IMPORT_ERROR = None
 
 
-_DEFAULT_MODEL: Final[str] = "gpt-5.4"
+_DEFAULT_MODEL: Final[str] = "gpt-5-mini"
 _DEFAULT_TIMEOUT_SECONDS: Final[float] = 30.0
 _DEFAULT_MAX_RETRIES: Final[int] = 2
 _ALLOWED_REASONING_EFFORTS: Final[frozenset[str]] = frozenset(

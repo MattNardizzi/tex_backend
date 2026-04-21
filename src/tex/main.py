@@ -101,7 +101,11 @@ class InMemoryPolicyClauseStoreAdapter:
                     policy_id=policy.policy_id,
                     policy_version=policy.version,
                     title="Blocked term restriction",
-                    text=f"The following term is explicitly blocked by policy: {term}",
+                    # Clause text carries the policy payload only. Downstream
+                    # overlap matchers tokenize this text, so any generic
+                    # English boilerplate here becomes false-positive surface
+                    # area against benign request content.
+                    text=term,
                     channel=request.channel,
                     action_type=request.action_type,
                     relevance_score=relevance,
@@ -122,10 +126,8 @@ class InMemoryPolicyClauseStoreAdapter:
                     policy_id=policy.policy_id,
                     policy_version=policy.version,
                     title="Sensitive entity handling",
-                    text=(
-                        "Content involving this policy-sensitive entity requires extra "
-                        f"care and review: {entity}"
-                    ),
+                    # Clause text is just the entity name for the same reason.
+                    text=entity,
                     channel=request.channel,
                     action_type=request.action_type,
                     relevance_score=relevance,
@@ -148,7 +150,10 @@ class InMemoryPolicyClauseStoreAdapter:
                     policy_id=policy.policy_id,
                     policy_version=policy.version,
                     title="Enabled recognizer policy",
-                    text=f"Recognizer enabled for this policy: {recognizer_name}",
+                    # Recognizer name only. The human-readable framing is in
+                    # the title; keeping the text minimal avoids accidental
+                    # overlap hits on generic English tokens.
+                    text=recognizer_name.replace("_", " "),
                     channel=request.channel,
                     action_type=request.action_type,
                     relevance_score=relevance,
@@ -285,6 +290,7 @@ def build_runtime(
         pdp=pdp,
         policy_store=policy_store,
         decision_store=decision_store,
+        precedent_store=precedent_store,
         evidence_recorder=recorder,
     )
 
@@ -340,6 +346,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Idempotent safety net. Runtime is already attached below at app
+        # construction time so that synchronous entry points (TestClient,
+        # direct import-time probes, test fixtures that skip lifespan)
+        # always observe a fully populated app.state.
         _attach_runtime_to_app(app, resolved_runtime)
         yield
 
@@ -352,6 +362,10 @@ def create_app(
         ),
         lifespan=lifespan,
     )
+
+    # Attach runtime state eagerly so that app.state is populated the moment
+    # create_app returns, regardless of whether the caller enters lifespan.
+    _attach_runtime_to_app(app, resolved_runtime)
 
     app.add_middleware(
         CORSMiddleware,

@@ -1,1 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment / secrets
 .env
+.env.local
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Build
+build/
+dist/
+
+# Evidence artifacts (runtime data, not source)
+var/tex/evidence/*.jsonl
+
+# Node (frontend, in case it lives here later)
+node_modules/
+.vite/

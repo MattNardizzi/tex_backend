@@ -583,15 +583,20 @@ class HeuristicSemanticFallback:
         Very light clause token extraction for fallback grounding.
 
         This is intentionally crude. It only tries to pull longer lexical units
-        that may overlap with risky action content. Minimum length is 8 to
-        avoid matching common words like 'review', 'report', 'update' etc.
-        that appear in both policy clauses and clean business content.
+        that may overlap with risky action content. Generic English and
+        policy boilerplate is filtered via a shared stopword set so common
+        prose words like 'following', 'requires', or 'review' cannot cause
+        false-positive overlaps against benign request content.
         """
+        from tex.specialists.judges import _CLAUSE_TOKEN_STOPWORDS
+
         raw_tokens = clause_text.replace(",", " ").replace(".", " ").split()
         tokens = []
         for token in raw_tokens:
             normalized = token.strip().casefold()
             if len(normalized) < 8:
+                continue
+            if normalized in _CLAUSE_TOKEN_STOPWORDS:
                 continue
             tokens.append(normalized)
         return tuple(dict.fromkeys(tokens))

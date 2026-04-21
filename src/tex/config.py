@@ -56,7 +56,7 @@ class Settings(BaseSettings):
         alias="TEX_ALLOW_SEMANTIC_FALLBACK",
     )
     semantic_model: str = Field(
-        default="gpt-5.4",
+        default="gpt-5-mini",
         alias="TEX_SEMANTIC_MODEL",
     )
     semantic_timeout_seconds: float = Field(
